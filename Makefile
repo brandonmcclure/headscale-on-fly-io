@@ -30,10 +30,8 @@ build_multiarch:
 	docker buildx build -t $(REGISTRY_NAME)$(REPOSITORY_NAME)$(IMAGE_NAME)$(TAG) --platform $(PLATFORMS) .
 
 run: build
-	docker run -d $(RUN_PORTS) $(REGISTRY_NAME)$(REPOSITORY_NAME)$(IMAGE_NAME)$(TAG)
+	docker run --name headscale -v ${pwd}/persistent:/persistent -d $(RUN_PORTS) $(REGISTRY_NAME)$(REPOSITORY_NAME)$(IMAGE_NAME)$(TAG)
 
-run_it:
-	docker run -it -d $(RUN_PORTS) $(REGISTRY_NAME)$(REPOSITORY_NAME)$(IMAGE_NAME)$(TAG)
 
 package:
 	$$PackageFileName = "$$("$(IMAGE_NAME)" -replace "/","_").tar"; docker save $(REGISTRY_NAME)$(REPOSITORY_NAME)$(IMAGE_NAME)$(TAG) -o $$PackageFileName
@@ -44,3 +42,10 @@ size:
 
 publish:
 	docker login; docker push $(REGISTRY_NAME)$(REPOSITORY_NAME)$(IMAGE_NAME)$(TAG); docker logout
+
+headscale_new_namespace_%:
+	docker exec headscale headscale namespace create $*
+
+headscale_register_machine_for_namespace_%:
+	docker exec headscale headscale --namespace $* preauthkeys create --reusable --expiration 24h
+	echo 'to register a machine with this auth key, run the following: tailscale up --login-server <YOUR_HEADSCALE_URL> --authkey <YOUR_AUTH_KEY>'
