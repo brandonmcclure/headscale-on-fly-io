@@ -9,7 +9,14 @@ on:
 env:
   FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
   FLY_APP_NAME: ${{ vars.FLY_APP_NAME }}
-  FLY_REGION: ${{ vars.FLY_REGION }}
+  FLY_BASE_APP_NAME: ${{ vars.FLY_APP_NAME }}
+  FLY_PRIMARY_REGION: ${{ vars.FLY_PRIMARY_REGION }}
+  FLY_SECONDARY_REGION: ${{ vars.FLY_SECONDARY_REGION }}
+  ARM_ACCESS_KEY: ${{ secrets.ARM_ACCESS_KEY}}
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   deploy:
@@ -24,18 +31,86 @@ jobs:
         run: 
           echo "FLY_APP_NAME=${FLY_APP_NAME}-${{ github.event.number }}" >> $GITHUB_ENV
 
-      - id: variable-substition-for-toml
+      - id: variable-substition
         run : |
+          echo "fly.toml:"
           envsubst < fly.template.toml | tee fly.toml
-          cat fly.toml 
-      
-      - id: create-app-and-volume-if-necessary
+          echo "config.yaml:"
+          envsubst < config.template.yaml | tee config.yaml
+          echo "terraform.tfvars"
+          envsubst < ./terraform/terraform.tfvars.template | tee ./terraform/terraform.tfvars
+    
+      # terraform boilerplate stuff
+      - id: tf-setup
+        uses: hashicorp/setup-terraform@v2
+      - id: tf-fmt
+        run: terraform fmt -check
+        working-directory: ./terraform
+        continue-on-error: true
+      - id: fix-tf-fmt
+        if: steps.tf-fmt.outcome == 'failure'
         run: |
-          if [[ $(flyctl apps list | grep -w "${FLY_APP_NAME}" | head -c1 | wc -c ) -eq 0 ]]
-          then
-            flyctl apps create ${FLY_APP_NAME}
-            flyctl volumes create persistent --size 1 --region ${FLY_REGION}
+          git fetch origin ${{ github.head_ref }}
+          git checkout ${{ github.head_ref }}
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          terraform fmt
+          git add .
+          git commit -m "fix terraform format "
+          git push
+        working-directory: ./terraform
+      - id: tf-init
+        run: terraform init
+        working-directory: ./terraform
+      - id: tf-validate
+        run: terraform validate -no-color
+        working-directory: ./terraform
+      - id: tf-workspace
+        run: |
+          terraform workspace list
+          if [ -z "$(terraform workspace list | grep $FLY_APP_NAME$ )" ]; then
+            terraform workspace new $FLY_APP_NAME
+          else
+            terraform workspace select $FLY_APP_NAME
+          fi
+        working-directory: ./terraform
+
+      - id: tf-apply
+        run: terraform apply -auto-approve -input=false
+        working-directory: ./terraform
+
+      # this clunk is here because fly doesn't have a primary region concept -- https://github.com/superfly/litefs/issues/259#issuecomment-1386368570
+      - id: first-deploy
+        run: |
+          if [ $(flyctl status --json -a $FLY_APP_NAME | jq ".Status") != '"running"' ]; then
+            flyctl secrets set HEADSCALE_PRIVATE_KEY="$HEADSCALE_PRIVATE_KEY" HEADSCALE_PRIVATE_NOISE_KEY="$HEADSCALE_PRIVATE_NOISE_KEY"
+            flyctl deploy
+            
+            # TODO: find the most recent snapshot from the primary app and use it for the secondary
+            
+            # now create the volume TODO: using that snapshot 
+            flyctl volumes create persistent --region $FLY_SECONDARY_REGION --size 1 
+            flyctl scale count 2 --max-per-region 1
+            echo "FIRST_APPLY=yes" >> $GITHUB_ENV
+          fi
+        env:
+          HEADSCALE_PRIVATE_KEY: ${{ secrets.HEADSCALE_PRIVATE_KEY }}
+          HEADSCALE_PRIVATE_NOISE_KEY: ${{ secrets.HEADSCALE_PRIVATE_NOISE_KEY }}
+
+      - id: not-first-deploy
+        run: |
+          if [ -z $FIRST_APPLY ]; then
+            flyctl deploy --strategy immediate
           fi
 
-      - id: deploy
-        run: flyctl deploy --remote-only --region ${FLY_REGION} 
+      - id: tf-plan-production
+        if: github.event_name == 'pull_request'
+        run: |
+          # cleanup the FLY_APP_NAME we polluted earlier
+          FLY_APP_NAME=$FLY_BASE_APP_NAME
+
+          # rerun the envsubst
+          envsubst < terraform.tfvars.template | tee terraform.tfvars
+          terraform workspace select $FLY_APP_NAME
+          terraform plan -no-color -input=false
+        working-directory: ./terraform
