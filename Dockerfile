@@ -1,4 +1,5 @@
-FROM ghcr.io/juanfont/headscale:0.18.0
+FROM ghcr.io/juanfont/headscale:0.22.3
+RUN mkdir /persistent
 
 COPY config.yaml /etc/headscale/config.yaml
 
